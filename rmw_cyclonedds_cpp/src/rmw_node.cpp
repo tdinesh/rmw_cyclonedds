@@ -1671,6 +1671,8 @@ extern "C" rmw_ret_t rmw_publish_serialized_message(
     RET_NULL_X(sample_ptr, return RMW_RET_ERROR);
     if (rmw_deserialize(serialized_message, &pub->type_supports, sample_ptr) != RMW_RET_OK) {
       RMW_SET_ERROR_MSG("Failed to deserialize sample into loaned memory");
+      fini_and_free_sample(pub, sample_ptr);
+      ddsi_serdata_unref(d);
       return RMW_RET_ERROR;
     }
     d->iox_chunk = SHIFT_BACK_TO_ICEORYX_HEADER(sample_ptr);
@@ -1707,12 +1709,14 @@ static rmw_ret_t publish_loaned_int(
 
   // if the publisher allow loaning
   if (cdds_publisher->is_loaning_available) {
-    auto d = std::make_unique<serdata_rmw>(cdds_publisher->sertype, ddsi_serdata_kind::SDK_DATA);
+    auto d = new serdata_rmw(cdds_publisher->sertype, ddsi_serdata_kind::SDK_DATA);
     d->iox_chunk = SHIFT_BACK_TO_ICEORYX_HEADER(ros_message);
-    if (dds_writecdr(cdds_publisher->enth, d.release()) >= 0) {
+    if (dds_writecdr(cdds_publisher->enth, d) >= 0) {
       return RMW_RET_OK;
     } else {
       RMW_SET_ERROR_MSG("Failed to publish data");
+      fini_and_free_sample(cdds_publisher, ros_message);
+      ddsi_serdata_unref(d);
       return RMW_RET_ERROR;
     }
   } else {
@@ -3053,13 +3057,11 @@ static rmw_ret_t rmw_take_ser_int(
             SHIFT_PAST_ICEORYX_HEADER(d->iox_chunk), &sub->type_supports,
             serialized_message) != RMW_RET_OK)
         {
-          RMW_SET_ERROR_MSG("Failed to srialize sample from loaned memory");
+          RMW_SET_ERROR_MSG("Failed to serialize sample from loaned memory");
+          ddsi_serdata_unref(d);
           return RMW_RET_ERROR;
         }
-        // free the loaned memory
-        dds_data_allocator_init(sub->enth, &sub->data_allocator);
-        dds_data_allocator_free(&sub->data_allocator, d->iox_chunk);
-        dds_data_allocator_fini(&sub->data_allocator);
+        ddsi_serdata_unref(d);
         *taken = true;
         return RMW_RET_OK;
       } else  // NOLINT
@@ -3126,23 +3128,32 @@ static rmw_ret_t rmw_take_loan_int(
       if (d->iox_chunk != nullptr) {
         *loaned_message = SHIFT_PAST_ICEORYX_HEADER(d->iox_chunk);
         *taken = true;
-        // doesn't allocate, but initialise the allocator to free the chunk later
+        // doesn't allocate, but initialise the allocator to free the chunk later when the loan
+        // is returned
         dds_data_allocator_init(
           cdds_subscription->enth, &cdds_subscription->data_allocator);
+        // set the loaned chunk to null, so that the  loaned chunk is not release in
+        // rmw_serdata_free(), but will be released when
+        // `rmw_return_loaned_message_from_subscription()` is called
+        d->iox_chunk = nullptr;
+        ddsi_serdata_unref(d);
         return RMW_RET_OK;
       } else if (d->type->iox_size > 0U) {
         auto sample_ptr = init_and_alloc_sample(cdds_subscription, d->type->iox_size, true);
         RET_NULL_X(sample_ptr, return RMW_RET_ERROR);
         ddsi_serdata_to_sample(d, sample_ptr, nullptr, nullptr);
         *loaned_message = sample_ptr;
+        ddsi_serdata_unref(d);
         *taken = true;
         return RMW_RET_OK;
       } else {
         RMW_SET_ERROR_MSG("Data nor loan is available to take");
+        ddsi_serdata_unref(d);
         *taken = false;
         return RMW_RET_ERROR;
       }
     }
+    ddsi_serdata_unref(d);
   }
   *taken = false;
   return RMW_RET_OK;
